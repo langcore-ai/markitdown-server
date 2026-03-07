@@ -14,6 +14,25 @@ uv sync
 uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+生产容器默认支持通过环境变量调整并发参数：
+
+- `MARKITDOWN_MAX_CONCURRENT_JOBS`：单个 worker 内最多同时执行多少个转换任务，默认 `4`
+- `MARKITDOWN_THREADPOOL_WORKERS`：单个 worker 的转换线程池大小，默认 `4`
+- `MARKITDOWN_CONVERT_TIMEOUT_SEC`：单次转换超时秒数，默认 `180`
+- `MARKITDOWN_MAX_UPLOAD_SIZE_MB`：上传文件大小上限，默认 `100`
+- `MARKITDOWN_UVICORN_WORKERS`：`uvicorn` worker 数，默认 `2`
+
+例如：
+
+```bash
+MARKITDOWN_MAX_CONCURRENT_JOBS=4 \
+MARKITDOWN_THREADPOOL_WORKERS=4 \
+MARKITDOWN_CONVERT_TIMEOUT_SEC=180 \
+MARKITDOWN_MAX_UPLOAD_SIZE_MB=100 \
+MARKITDOWN_UVICORN_WORKERS=2 \
+uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+```
+
 ## 接口
 
 - `GET /health`：健康检查
@@ -30,6 +49,12 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - `exiftool_path`：指定 exiftool 路径
 - `style_map`：DOCX 转换使用的 mammoth style map
 - `docintel_endpoint` / `docintel_api_version`：Azure Document Intelligence 配置
+
+并发保护行为：
+
+- 当服务内部转换槽位已满时，`POST /convert` 会返回 `429`
+- 当上传文件超过大小限制时，`POST /convert` 会返回 `413`
+- 当单次转换超时时，`POST /convert` 会返回 `408`
 
 ### curl 示例
 

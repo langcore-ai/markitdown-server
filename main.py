@@ -1,19 +1,274 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import shutil
 import tempfile
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, MutableMapping
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from markitdown import MarkItDown
 from openai import OpenAI
 
-app = FastAPI(title="MarkItDown API", version="0.1.0")
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_EXIFTOOL_PATH = "/usr/bin/exiftool"
+DEFAULT_MAX_CONCURRENT_JOBS = 4
+DEFAULT_CONVERT_TIMEOUT_SEC = 180
+DEFAULT_MAX_UPLOAD_SIZE_MB = 100
+DEFAULT_THREADPOOL_WORKERS = 4
+DEFAULT_UVICORN_WORKERS = 2
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+logger = logging.getLogger("markitdown_server")
+logging.basicConfig(
+    level=os.getenv("MARKITDOWN_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+
+def read_int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("invalid integer env, fallback to default", extra={"env": name})
+        return default
+    return max(minimum, value)
+
+
+MAX_CONCURRENT_JOBS = read_int_env(
+    "MARKITDOWN_MAX_CONCURRENT_JOBS",
+    DEFAULT_MAX_CONCURRENT_JOBS,
+)
+CONVERT_TIMEOUT_SEC = read_int_env(
+    "MARKITDOWN_CONVERT_TIMEOUT_SEC",
+    DEFAULT_CONVERT_TIMEOUT_SEC,
+)
+MAX_UPLOAD_SIZE_MB = read_int_env(
+    "MARKITDOWN_MAX_UPLOAD_SIZE_MB",
+    DEFAULT_MAX_UPLOAD_SIZE_MB,
+)
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+THREADPOOL_WORKERS = read_int_env(
+    "MARKITDOWN_THREADPOOL_WORKERS",
+    DEFAULT_THREADPOOL_WORKERS,
+)
+
+
+class RequestLoggerAdapter(logging.LoggerAdapter):
+    def process(
+        self, msg: str, kwargs: MutableMapping[str, Any]
+    ) -> tuple[str, MutableMapping[str, Any]]:
+        extra_context: Mapping[str, Any] = (
+            self.extra if isinstance(self.extra, Mapping) else {}
+        )
+        request_id = str(extra_context.get("request_id", "unknown"))
+        extra = kwargs.setdefault("extra", {})
+        extra.setdefault("request_id", request_id)
+        return f"[request_id={request_id}] {msg}", kwargs
+
+
+class BusyError(Exception):
+    pass
+
+
+@dataclass(slots=True)
+class ConvertOptions:
+    enable_plugins: bool
+    keep_data_uris: bool
+    llm_model: str | None
+    llm_prompt: str | None
+    openai_api_key: str | None
+    openai_base_url: str | None
+    exiftool_path: str | None
+    style_map: str | None
+    docintel_endpoint: str | None
+    docintel_api_version: str | None
+
+
+@dataclass(slots=True)
+class StoredUpload:
+    filename: str
+    temp_dir: Path
+    temp_file_path: Path
+    size_bytes: int
+
+
+def build_converter_kwargs(options: ConvertOptions) -> dict[str, Any]:
+    converter_kwargs: dict[str, Any] = {
+        "enable_plugins": options.enable_plugins,
+        "exiftool_path": options.exiftool_path,
+        "style_map": options.style_map,
+        "docintel_endpoint": options.docintel_endpoint,
+        "docintel_api_version": options.docintel_api_version,
+    }
+    converter_kwargs = {key: value for key, value in converter_kwargs.items() if value is not None}
+
+    if options.llm_model:
+        client_kwargs: dict[str, Any] = {}
+        if options.openai_api_key:
+            client_kwargs["api_key"] = options.openai_api_key
+        resolved_base_url = (
+            options.openai_base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or DEFAULT_OPENAI_BASE_URL
+        )
+        client_kwargs["base_url"] = resolved_base_url
+        converter_kwargs["llm_client"] = OpenAI(**client_kwargs)
+        converter_kwargs["llm_model"] = options.llm_model
+        if options.llm_prompt:
+            converter_kwargs["llm_prompt"] = options.llm_prompt
+
+    return converter_kwargs
+
+
+def run_conversion(file_path: Path, options: ConvertOptions) -> dict[str, Any]:
+    converter = MarkItDown(**build_converter_kwargs(options))
+    result = converter.convert(file_path, keep_data_uris=options.keep_data_uris)
+    return {
+        "title": result.title,
+        "markdown": result.markdown,
+        "text_content": result.text_content,
+    }
+
+
+async def store_upload_file(file: UploadFile, request_logger: RequestLoggerAdapter) -> StoredUpload:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing uploaded filename")
+
+    temp_dir = Path(tempfile.gettempdir()) / f"markitdown-{uuid.uuid4().hex}"
+    temp_dir.mkdir(parents=True, exist_ok=False)
+    temp_file_path = temp_dir / Path(file.filename).name
+    size_bytes = 0
+
+    try:
+        with temp_file_path.open("wb") as output:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                if size_bytes > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file is too large, limit is {MAX_UPLOAD_SIZE_MB} MB",
+                    )
+                output.write(chunk)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    finally:
+        await file.close()
+
+    request_logger.info(
+        "upload stored",
+        extra={"filename": file.filename, "size_bytes": size_bytes},
+    )
+    return StoredUpload(
+        filename=file.filename,
+        temp_dir=temp_dir,
+        temp_file_path=temp_file_path,
+        size_bytes=size_bytes,
+    )
+
+
+async def run_conversion_with_limit(
+    stored_upload: StoredUpload,
+    options: ConvertOptions,
+    request_logger: RequestLoggerAdapter,
+) -> dict[str, Any]:
+    semaphore: asyncio.Semaphore = app.state.convert_semaphore
+    thread_pool: ThreadPoolExecutor = app.state.thread_pool
+
+    if semaphore.locked():
+        request_logger.warning("conversion rejected because server is busy")
+        raise BusyError
+
+    async with semaphore:
+        loop = asyncio.get_running_loop()
+        started_at = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    thread_pool,
+                    run_conversion,
+                    stored_upload.temp_file_path,
+                    options,
+                ),
+                timeout=CONVERT_TIMEOUT_SEC,
+            )
+        except TimeoutError as exc:
+            request_logger.warning(
+                "conversion timed out",
+                extra={
+                    "filename": stored_upload.filename,
+                    "size_bytes": stored_upload.size_bytes,
+                    "timeout_sec": CONVERT_TIMEOUT_SEC,
+                },
+            )
+            raise HTTPException(status_code=408, detail="Conversion timed out") from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            request_logger.exception(
+                "conversion failed",
+                extra={
+                    "filename": stored_upload.filename,
+                    "size_bytes": stored_upload.size_bytes,
+                },
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Conversion failed: {exc}",
+            ) from exc
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        request_logger.info(
+            "conversion completed",
+            extra={
+                "filename": stored_upload.filename,
+                "size_bytes": stored_upload.size_bytes,
+                "duration_ms": duration_ms,
+            },
+        )
+        return result
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    app_instance.state.convert_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+    app_instance.state.thread_pool = ThreadPoolExecutor(
+        max_workers=THREADPOOL_WORKERS,
+        thread_name_prefix="markitdown-convert",
+    )
+    logger.info(
+        "markitdown server started",
+        extra={
+            "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+            "convert_timeout_sec": CONVERT_TIMEOUT_SEC,
+            "max_upload_size_mb": MAX_UPLOAD_SIZE_MB,
+            "threadpool_workers": THREADPOOL_WORKERS,
+            "uvicorn_workers": read_int_env(
+                "MARKITDOWN_UVICORN_WORKERS",
+                DEFAULT_UVICORN_WORKERS,
+            ),
+        },
+    )
+    try:
+        yield
+    finally:
+        app_instance.state.thread_pool.shutdown(wait=False, cancel_futures=True)
+
+
+app = FastAPI(title="MarkItDown API", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -57,58 +312,44 @@ async def convert(
         None, description="Azure Document Intelligence API 版本（可选）"
     ),
 ) -> dict[str, Any]:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing uploaded filename")
+    request_id = uuid.uuid4().hex
+    request_logger = RequestLoggerAdapter(logger, {"request_id": request_id})
+    options = ConvertOptions(
+        enable_plugins=enable_plugins,
+        keep_data_uris=keep_data_uris,
+        llm_model=llm_model,
+        llm_prompt=llm_prompt,
+        openai_api_key=openai_api_key,
+        openai_base_url=openai_base_url,
+        exiftool_path=exiftool_path,
+        style_map=style_map,
+        docintel_endpoint=docintel_endpoint,
+        docintel_api_version=docintel_api_version,
+    )
 
-    converter_kwargs: dict[str, Any] = {
-        "enable_plugins": enable_plugins,
-        "exiftool_path": exiftool_path,
-        "style_map": style_map,
-        "docintel_endpoint": docintel_endpoint,
-        "docintel_api_version": docintel_api_version,
-    }
-    converter_kwargs = {k: v for k, v in converter_kwargs.items() if v is not None}
-
-    if llm_model:
-        client_kwargs: dict[str, Any] = {}
-        if openai_api_key:
-            client_kwargs["api_key"] = openai_api_key
-        resolved_base_url = (
-            openai_base_url
-            or os.getenv("OPENAI_BASE_URL")
-            or DEFAULT_OPENAI_BASE_URL
-        )
-        client_kwargs["base_url"] = resolved_base_url
-
-        converter_kwargs["llm_client"] = OpenAI(**client_kwargs)
-        converter_kwargs["llm_model"] = llm_model
-        if llm_prompt:
-            converter_kwargs["llm_prompt"] = llm_prompt
-
-    converter = MarkItDown(**converter_kwargs)
-
-    temp_dir = Path(tempfile.gettempdir()) / f"markitdown-{uuid.uuid4().hex}"
-    temp_dir.mkdir(parents=True, exist_ok=False)
-    temp_file_path = temp_dir / Path(file.filename).name
-
+    stored_upload: StoredUpload | None = None
     try:
-        with temp_file_path.open("wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-
-        result = converter.convert(temp_file_path, keep_data_uris=keep_data_uris)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Conversion failed: {exc}") from exc
+        stored_upload = await store_upload_file(file, request_logger)
+        conversion_result = await run_conversion_with_limit(
+            stored_upload,
+            options,
+            request_logger,
+        )
+    except BusyError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Server is busy, please retry later",
+        ) from exc
     finally:
-        await file.close()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if stored_upload is not None:
+            shutil.rmtree(stored_upload.temp_dir, ignore_errors=True)
+
+    if stored_upload is None:
+        raise HTTPException(status_code=500, detail="Upload state missing")
 
     return {
-        "filename": file.filename,
-        "title": result.title,
-        "markdown": result.markdown,
-        "text_content": result.text_content,
+        "filename": stored_upload.filename,
+        "title": conversion_result["title"],
+        "markdown": conversion_result["markdown"],
+        "text_content": conversion_result["text_content"],
     }
