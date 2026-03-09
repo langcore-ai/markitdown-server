@@ -1,12 +1,12 @@
 FROM docker.1ms.run/python:3.13-slim
-ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+ARG UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_DEFAULT_INDEX=${UV_DEFAULT_INDEX} \
     MARKITDOWN_UVICORN_WORKERS=2
-ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 RUN printf '%s\n' \
     'Types: deb' \
     "URIs: ${DEBIAN_MIRROR}/debian" \
@@ -30,8 +30,8 @@ RUN apt-get update \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+COPY pyproject.toml ./
+RUN uv sync --no-dev
 
 COPY main.py ./
 
