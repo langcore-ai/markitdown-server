@@ -171,7 +171,7 @@ async def store_upload_file(file: UploadFile, request_logger: RequestLoggerAdapt
 
     request_logger.info(
         "upload stored",
-        extra={"filename": file.filename, "size_bytes": size_bytes},
+        extra={"upload_filename": file.filename, "size_bytes": size_bytes},
     )
     return StoredUpload(
         filename=file.filename,
@@ -210,7 +210,7 @@ async def run_conversion_with_limit(
             request_logger.warning(
                 "conversion timed out",
                 extra={
-                    "filename": stored_upload.filename,
+                    "upload_filename": stored_upload.filename,
                     "size_bytes": stored_upload.size_bytes,
                     "timeout_sec": CONVERT_TIMEOUT_SEC,
                 },
@@ -222,7 +222,7 @@ async def run_conversion_with_limit(
             request_logger.exception(
                 "conversion failed",
                 extra={
-                    "filename": stored_upload.filename,
+                    "upload_filename": stored_upload.filename,
                     "size_bytes": stored_upload.size_bytes,
                 },
             )
@@ -234,7 +234,7 @@ async def run_conversion_with_limit(
         request_logger.info(
             "conversion completed",
             extra={
-                "filename": stored_upload.filename,
+                "upload_filename": stored_upload.filename,
                 "size_bytes": stored_upload.size_bytes,
                 "duration_ms": duration_ms,
             },
