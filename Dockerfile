@@ -1,4 +1,4 @@
-FROM docker.1ms.run/python:3.13-slim
+FROM astral/uv:python3.13-trixie-slim
 ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
 ARG UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -24,16 +24,19 @@ RUN printf '%s\n' \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libimage-exiftool-perl \
-    && rm -rf /var/lib/apt/lists/*
+# 保留 apt 下载缓存，配合 BuildKit cache mount 复用 deb 包。
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libimage-exiftool-perl
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --link pyproject.toml ./
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --no-dev
 
-COPY pyproject.toml ./
-RUN uv sync --no-dev
-
-COPY main.py ./
+COPY --link main.py ./
 
 EXPOSE 8000
 
