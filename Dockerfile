@@ -30,7 +30,7 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libimage-exiftool-perl
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libreoffice libimage-exiftool-perl
 
 COPY --link pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \

@@ -21,6 +21,8 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - `MARKITDOWN_CONVERT_TIMEOUT_SEC`：单次转换超时秒数，默认 `180`
 - `MARKITDOWN_MAX_UPLOAD_SIZE_MB`：上传文件大小上限，默认 `100`
 - `MARKITDOWN_UVICORN_WORKERS`：`uvicorn` worker 数，默认 `2`
+- `MARKITDOWN_SOFFICE_PATH`：LibreOffice 可执行文件路径，默认 `/usr/bin/soffice`
+- `MARKITDOWN_SUBPROCESS_TIMEOUT_SEC`：外部预处理命令超时秒数，默认 `60`
 
 例如：
 
@@ -35,7 +37,7 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 
 ## 接口
 
-- `GET /health`：健康检查
+- `GET /health`：健康检查, 除 `status` 外，还会返回 `soffice`、`exiftool` 的可用性。
 - `POST /convert`：通过表单上传文件并转换为 Markdown
 
 可选表单参数（部分）：
@@ -55,6 +57,33 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 - 当服务内部转换槽位已满时，`POST /convert` 会返回 `429`
 - 当上传文件超过大小限制时，`POST /convert` 会返回 `413`
 - 当单次转换超时时，`POST /convert` 会返回 `408`
+- 当文件类型不支持或扩展名与 `content-type` 明显冲突时，`POST /convert` 会返回 `415`
+- 当旧版 `doc / ppt` 预转换失败或 `MarkItDown` 无法处理已声明支持的格式时，`POST /convert` 会返回 `422`
+- 当关键依赖缺失（如 `soffice` 不存在）时，`POST /convert` 会返回 `500`
+
+### 成功响应
+
+- `filename`
+- `title`
+- `markdown`
+- `text_content`
+- `ok`
+- `detected_type`
+- `pipeline`
+- `preprocessed_from`
+- `duration_ms`
+
+### 失败响应
+
+失败时使用结构化 `detail`，至少包含：
+
+- `ok`
+- `code`
+- `message`
+- `detected_type`
+- `stage`
+- `retryable`
+- `attempted_stages`
 
 ### curl 示例
 
