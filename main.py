@@ -10,7 +10,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Mapping, MutableMapping, cast
 
@@ -28,6 +28,7 @@ DEFAULT_THREADPOOL_WORKERS = 4
 DEFAULT_UVICORN_WORKERS = 2
 DEFAULT_SUBPROCESS_TIMEOUT_SEC = 60
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+MULTIMODAL_FALLBACK_REASON = "llm_enhanced_conversion_failed"
 
 TEXT_EXTENSIONS = {
     ".csv",
@@ -438,6 +439,22 @@ def build_converter_kwargs(options: ConvertOptions) -> dict[str, Any]:
     return converter_kwargs
 
 
+def disable_multimodal_options(options: ConvertOptions) -> ConvertOptions:
+    """复制一份关闭多模态描述的参数，用于增强链路失败后的降级重试。"""
+
+    return replace(
+        options,
+        llm_model=None,
+        llm_prompt=None,
+    )
+
+
+def should_retry_without_multimodal(options: ConvertOptions) -> bool:
+    """判断当前请求是否启用了多模态增强，从而允许降级重试。"""
+
+    return bool(options.llm_model)
+
+
 def pick_preprocessed_output(
     output_dir: Path,
     source_file_path: Path,
@@ -558,6 +575,7 @@ def run_markitdown_convert(
     effective_type: EffectiveInputType,
     options: ConvertOptions,
     attempted_stages: list[str],
+    request_logger: RequestLoggerAdapter | None = None,
 ) -> dict[str, Any]:
     """执行最终的 MarkItDown 转换。"""
 
@@ -565,6 +583,56 @@ def run_markitdown_convert(
         converter = MarkItDown(**build_converter_kwargs(options))
         result = converter.convert(file_path, keep_data_uris=options.keep_data_uris)
     except Exception as exc:
+        if should_retry_without_multimodal(options):
+            original_error = compact_message(
+                str(exc),
+                f"MarkItDown failed to convert {effective_type} with multimodal enabled.",
+            )
+            if request_logger is not None:
+                request_logger.warning(
+                    "llm-enhanced conversion failed, retrying without multimodal",
+                    extra={
+                        "effective_type": effective_type,
+                        "source_file": str(file_path),
+                        "original_error": original_error,
+                    },
+                )
+
+            retry_options = disable_multimodal_options(options)
+            try:
+                converter = MarkItDown(**build_converter_kwargs(retry_options))
+                result = converter.convert(
+                    file_path,
+                    keep_data_uris=retry_options.keep_data_uris,
+                )
+            except Exception as retry_exc:
+                raise_structured_http_error(
+                    status_code=422,
+                    code="MARKITDOWN_CONVERT_FAILED",
+                    message=compact_message(
+                        str(retry_exc),
+                        (
+                            f"MarkItDown failed to convert {effective_type} "
+                            "after retrying without multimodal enhancement."
+                        ),
+                    ),
+                    detected_type=effective_type,
+                    stage="convert_markitdown",
+                    retryable=False,
+                    attempted_stages=attempted_stages,
+                    multimodal_fallback_attempted=True,
+                    multimodal_fallback_reason=MULTIMODAL_FALLBACK_REASON,
+                    original_error=original_error,
+                )
+
+            return {
+                "title": result.title,
+                "markdown": result.markdown,
+                "text_content": result.text_content,
+                "multimodal_fallback_applied": True,
+                "multimodal_fallback_reason": MULTIMODAL_FALLBACK_REASON,
+            }
+
         raise_structured_http_error(
             status_code=422,
             code="MARKITDOWN_CONVERT_FAILED",
@@ -582,12 +650,15 @@ def run_markitdown_convert(
         "title": result.title,
         "markdown": result.markdown,
         "text_content": result.text_content,
+        "multimodal_fallback_applied": False,
+        "multimodal_fallback_reason": None,
     }
 
 
 def run_conversion_pipeline(
     stored_upload: StoredUpload,
     options: ConvertOptions,
+    request_logger: RequestLoggerAdapter | None = None,
 ) -> dict[str, Any]:
     """执行规范化转换管线，并返回统一成功响应所需字段。"""
 
@@ -637,12 +708,15 @@ def run_conversion_pipeline(
         effective_type=effective_type,
         options=options,
         attempted_stages=attempted_stages,
+        request_logger=request_logger,
     )
     append_pipeline_stage(
         pipeline,
         "convert_markitdown",
         convert_started_at,
         detected_type=effective_type,
+        multimodal_fallback_applied=conversion_result["multimodal_fallback_applied"],
+        multimodal_fallback_reason=conversion_result["multimodal_fallback_reason"],
     )
 
     return {
@@ -743,6 +817,7 @@ async def run_conversion_with_limit(
                     run_conversion_pipeline,
                     stored_upload,
                     options,
+                    request_logger,
                 ),
                 timeout=CONVERT_TIMEOUT_SEC,
             )

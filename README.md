@@ -61,6 +61,12 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 - 当旧版 `doc / ppt` 预转换失败或 `MarkItDown` 无法处理已声明支持的格式时，`POST /convert` 会返回 `422`
 - 当关键依赖缺失（如 `soffice` 不存在）时，`POST /convert` 会返回 `500`
 
+开启 `llm_model` 时有一个额外的兼容行为：
+
+- 若增强后的 `MarkItDown` 转换先失败
+- 服务会记录 warning 日志，并自动重试一次“关闭多模态增强”的降级转换
+- 成功时会在 `pipeline` 的 `convert_markitdown` 阶段附带 `multimodal_fallback_applied=true`
+
 ### 成功响应
 
 - `filename`
