@@ -8,6 +8,11 @@ dependencies = [
     "fastapi>=0.129.0",
     "markitdown[all]>=0.1.4",
     "openai>=2.21.0",
+    "pymupdf>=1.27.2.3",
     "python-multipart>=0.0.20",
     "uvicorn>=0.38.0",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
