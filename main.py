@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
-import mimetypes
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 import time
-import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -573,171 +569,6 @@ def preprocess_legacy_office_file(
     return converted_path, target_type
 
 
-# ---------------------------------------------------------------------------
-# Markdown 图片内联
-# ---------------------------------------------------------------------------
-
-IMAGE_SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".tif", ".tiff"}
-
-
-def _resolve_local_image_path(src: str, base_dir: Path) -> Path | None:
-    """将 Markdown 图片引用解析为实际文件路径。"""
-
-    if not src or not src.strip():
-        return None
-
-    decoded = urllib.parse.unquote(src.strip())
-
-    # 跳过外部链接和 data URI
-    if re.match(r"^(https?://|//|data:)", decoded, re.IGNORECASE):
-        return None
-
-    candidate = Path(decoded)
-    if not candidate.is_absolute():
-        candidate = base_dir / candidate
-
-    if candidate.exists() and candidate.is_file():
-        return candidate.resolve()
-
-    # 按文件名在 base_dir 下递归搜索
-    candidates = sorted(base_dir.rglob(candidate.name))
-    if candidates:
-        return candidates[0].resolve()
-
-    return None
-
-
-def _file_to_data_uri(file_path: Path) -> str:
-    """将图片文件编码为 base64 data URI。"""
-
-    mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-    with file_path.open("rb") as fh:
-        encoded = base64.b64encode(fh.read()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
-def _embed_local_images_as_data_uris(markdown_text: str, base_dir: Path) -> str:
-    """将 Markdown 中指向本地文件的图片引用替换为内联 data URI。"""
-
-    # Markdown 图片语法 ![alt](path)
-    def _replace_markdown_img(match: re.Match[str]) -> str:
-        alt, src = match.group(1), match.group(2)
-        if not src.strip():
-            return match.group(0)
-        img_path = _resolve_local_image_path(src, base_dir)
-        if img_path is None:
-            return match.group(0)
-        try:
-            return f"![{alt}]({_file_to_data_uri(img_path)})"
-        except Exception:
-            return match.group(0)
-
-    markdown_text = re.sub(
-        r"!\[([^\]]*)\]\(([^)]+)\)",
-        _replace_markdown_img,
-        markdown_text,
-    )
-
-    # HTML <img> 语法
-    def _replace_html_img(match: re.Match[str]) -> str:
-        before, src, after = match.group(1), match.group(2), match.group(3)
-        if not src.strip():
-            return match.group(0)
-        img_path = _resolve_local_image_path(src, base_dir)
-        if img_path is None:
-            return match.group(0)
-        try:
-            return f"{before}{_file_to_data_uri(img_path)}{after}"
-        except Exception:
-            return match.group(0)
-
-    markdown_text = re.sub(
-        r"(<img[^>]*?\ssrc\s*=\s*[\"'])([^\"']+)([\"'][^>]*>)",
-        _replace_html_img,
-        markdown_text,
-        flags=re.IGNORECASE,
-    )
-
-    return markdown_text
-
-
-# ---------------------------------------------------------------------------
-# PDF → Markdown（基于 pymupdf，保留图片原位）
-# ---------------------------------------------------------------------------
-
-def _convert_pdf_with_pymupdf(source_path: Path, output_dir: Path) -> str:
-    """使用 pymupdf 将 PDF 转为 Markdown，文本块和图片按页面坐标交错排列。
-
-    图片写入 output_dir 并以相对文件名引用，由
-    `_embed_local_images_as_data_uris` 在后续步骤内联为 data URI。
-    """
-
-    import fitz as _fitz
-
-    doc = _fitz.open(str(source_path))
-    page_markdown_chunks: list[str] = []
-
-    try:
-        for page_num in range(doc.page_count):
-            page = doc[page_num]
-            entries: list[tuple[float, str]] = []  # (y_position, markdown_fragment)
-
-            # ── 文本块 ────────────────────────────────────────
-            for block in page.get_text("blocks"):  # type: ignore[attr-defined]
-                # block = (x0, y0, x1, y1, text, block_no, block_type)
-                if len(block) < 7:
-                    continue
-                if block[6] != 0:  # 仅处理文本块（block_type == 0）
-                    continue
-                text = (block[4] or "").strip()
-                if text:
-                    entries.append((block[1], text + "\n"))
-
-            # ── 图片提取 ──────────────────────────────────────
-            # get_image_info 提供 bbox（页面坐标），get_images 提供 xref（数据引用）。
-            # 二者使用图片在页面上的出现顺序一一对应：image_infos[i] ↔ all_images[i]。
-            image_infos = page.get_image_info()  # type: ignore[attr-defined]
-            all_images = page.get_images(full=True)  # type: ignore[attr-defined]
-
-            for idx, img_info in enumerate(image_infos):
-                bbox = img_info.get("bbox")
-                if bbox is None:
-                    continue
-
-                # 取 xref：优先用 image_info 自带的，否则用 get_images 同位置元组
-                xref = img_info.get("xref")
-                if (xref is None or xref == 0) and idx < len(all_images):
-                    xref = all_images[idx][0] if all_images[idx] else 0
-
-                if xref is None or xref == 0:
-                    continue
-
-                try:
-                    extracted = doc.extract_image(xref)  # type: ignore[attr-defined]
-                except Exception:
-                    continue
-
-                img_bytes = extracted.get("image")
-                if not img_bytes:
-                    continue
-
-                img_ext = extracted.get("ext", "png")
-                filename = f"pdfimg_p{page_num + 1}_{uuid.uuid4().hex[:8]}.{img_ext}"
-                (output_dir / filename).write_bytes(img_bytes)
-
-                y0 = bbox[1] if isinstance(bbox, (list, tuple)) and len(bbox) >= 2 else 0.0
-                entries.append((y0, f"![image]({filename})\n"))
-
-            # ── 按 Y 坐标排序，构建页面 Markdown ──────────────
-            entries.sort(key=lambda e: e[0])
-            page_md = "\n".join(fragment for _, fragment in entries).strip()
-            if page_md:
-                page_markdown_chunks.append(page_md)
-
-    finally:
-        doc.close()
-
-
 def run_markitdown_convert(
     *,
     file_path: Path,
@@ -870,60 +701,27 @@ def run_conversion_pipeline(
             target_type=effective_type,
         )
 
-    base_dir = current_file_path.parent
-
     convert_started_at = time.perf_counter()
     attempted_stages.append("convert_markitdown")
-
-    if effective_type == "pdf":
-        # PDF：使用 pymupdf 提取文本块 + 图片并按坐标交错排列
-        conversion_started_at = time.perf_counter()
-        pdf_markdown = _convert_pdf_with_pymupdf(current_file_path, base_dir)
-        conversion_result = {
-            "title": None,
-            "markdown": pdf_markdown,
-            "text_content": pdf_markdown,
-            "multimodal_fallback_applied": False,
-            "multimodal_fallback_reason": None,
-        }
-        append_pipeline_stage(
-            pipeline,
-            "convert_pymupdf",
-            conversion_started_at,
-            detected_type="pdf",
-        )
-    else:
-        conversion_result = run_markitdown_convert(
-            file_path=current_file_path,
-            effective_type=effective_type,
-            options=options,
-            attempted_stages=attempted_stages,
-            request_logger=request_logger,
-        )
-        append_pipeline_stage(
-            pipeline,
-            "convert_markitdown",
-            convert_started_at,
-            detected_type=effective_type,
-            multimodal_fallback_applied=conversion_result["multimodal_fallback_applied"],
-            multimodal_fallback_reason=conversion_result["multimodal_fallback_reason"],
-        )
-
-    # ── 图片内联：本地路径 → data URI ──────────────────────────
-    embed_started_at = time.perf_counter()
-    embedded_markdown = _embed_local_images_as_data_uris(
-        conversion_result["markdown"],
-        base_dir,
+    conversion_result = run_markitdown_convert(
+        file_path=current_file_path,
+        effective_type=effective_type,
+        options=options,
+        attempted_stages=attempted_stages,
+        request_logger=request_logger,
     )
     append_pipeline_stage(
         pipeline,
-        "embed_local_images",
-        embed_started_at,
+        "convert_markitdown",
+        convert_started_at,
+        detected_type=effective_type,
+        multimodal_fallback_applied=conversion_result["multimodal_fallback_applied"],
+        multimodal_fallback_reason=conversion_result["multimodal_fallback_reason"],
     )
 
     return {
         "title": conversion_result["title"],
-        "markdown": embedded_markdown,
+        "markdown": conversion_result["markdown"],
         "text_content": conversion_result["text_content"],
         "detected_type": effective_type,
         "preprocessed_from": preprocessed_from,
@@ -1139,7 +937,7 @@ async def convert(
         False, description="是否启用 MarkItDown 三方插件（默认 false）"
     ),
     keep_data_uris: bool = Form(
-        True, description="是否保留 data URI（默认 true）"
+        False, description="是否保留 data URI（默认 false）"
     ),
     llm_model: str | None = Form(
         None, description="多模态模型名，例如 gpt-4o（用于图片描述）"
