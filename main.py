@@ -206,6 +206,15 @@ def compact_message(value: str, fallback: str, limit: int = 400) -> str:
     return f"{compacted[:limit]}..."
 
 
+def coalesce_text(*values: Any) -> str:
+    """按顺序返回首个非空字符串，避免把 None 传入后续文本处理。"""
+
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def resolve_binary_status(configured_path: str) -> dict[str, Any]:
     """解析依赖命令路径，并返回当前可用性。"""
 
@@ -627,8 +636,8 @@ def run_markitdown_convert(
 
             return {
                 "title": result.title,
-                "markdown": result.markdown,
-                "text_content": result.text_content,
+                "markdown": coalesce_text(result.markdown, result.text_content),
+                "text_content": coalesce_text(result.text_content, result.markdown),
                 "multimodal_fallback_applied": True,
                 "multimodal_fallback_reason": MULTIMODAL_FALLBACK_REASON,
             }
@@ -648,8 +657,8 @@ def run_markitdown_convert(
 
     return {
         "title": result.title,
-        "markdown": result.markdown,
-        "text_content": result.text_content,
+        "markdown": coalesce_text(result.markdown, result.text_content),
+        "text_content": coalesce_text(result.text_content, result.markdown),
         "multimodal_fallback_applied": False,
         "multimodal_fallback_reason": None,
     }
