@@ -1,4 +1,4 @@
-FROM astral/uv:python3.13-trixie-slim
+FROM astral/uv:python3.13-trixie-slim@sha256:331fbb158258608b9391e802305a9a2c9e42d689435c1d98706647122a122ab0
 ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
 ARG UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -37,6 +37,9 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --no-dev
 
 COPY --link main.py ./
+
+# Reject stale Debian CA packages even when a build cache or mirror is used.
+RUN dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1
 
 EXPOSE 8000
 
